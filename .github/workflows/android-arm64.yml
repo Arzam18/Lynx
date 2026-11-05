@@ -1,0 +1,242 @@
+name: Lynx Android ARM64 NativeAOT (NEON-capable)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Lynx UCI for Android ARM64
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout Lynx
+        uses: actions/checkout@v4
+
+      - name: Set up patched .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.114
+
+      - name: Install build utilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            lld llvm binutils \
+            build-essential zlib1g-dev unzip curl python3
+
+      - name: Install Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Configure Android NDK toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -d "$TOOLCHAIN"
+          test -x "$TOOLCHAIN/clang"
+          test -x "$TOOLCHAIN/ld.lld"
+          echo "$TOOLCHAIN" >> "$GITHUB_PATH"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "Android NDK: $NDK"
+          "$TOOLCHAIN/clang" --version
+          "$TOOLCHAIN/ld.lld" --version
+
+      - name: Verify Lynx CLI and ARM-safe CPU dispatch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f global.json
+          test -f Directory.Build.props
+          test -f src/Lynx.Cli/Lynx.Cli.csproj
+          test -f src/Lynx/Lynx.csproj
+          test -s src/Lynx.Cli/appsettings.json
+          grep -q 'TargetFramework>net10.0<' Directory.Build.props
+          grep -q 'Bmi2.X64.IsSupported' src/Lynx/Attacks.cs
+          grep -q 'MagicNumbersBishopAttacks' src/Lynx/Attacks.cs
+          grep -q 'MagicNumbersRookAttacks' src/Lynx/Attacks.cs
+          grep -q 'Bmi1.IsSupported' src/Lynx/Model/Bitboard.cs
+          grep -q 'Sse.IsSupported' src/Lynx/Model/TranspositionTable.cs
+          grep -q 'ARM AdvSimd (NEON)' src/Lynx/UCIHandler.cs
+          NETWORK_FILES="$(find src -type f \( -iname '*.nnue' -o -iname '*.weights' -o -iname '*.net' \) -print)"
+          if [ -n "$NETWORK_FILES" ]; then
+            echo "Unexpected external neural-network file found; inspect before continuing."
+            printf '%s\n' "$NETWORK_FILES"
+            exit 1
+          fi
+          echo "Publishing the UCI CLI project only: src/Lynx.Cli/Lynx.Cli.csproj"
+          echo "Lynx source version: $(dotnet msbuild src/Lynx.Cli/Lynx.Cli.csproj -getProperty:Version)"
+          dotnet --info
+          clang --version
+
+      - name: Inject the patched Android Bionic NativeAOT runtime pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          project = Path("src/Lynx.Cli/Lynx.Cli.csproj")
+          content = project.read_text(encoding="utf-8-sig")
+          package_id = "Microsoft.NETCore.App.Runtime.NativeAOT.linux-bionic-arm64"
+          package_line = (
+              '<PackageDownload '
+              'Include="Microsoft.NETCore.App.Runtime.NativeAOT.linux-bionic-arm64" '
+              'Version="[10.0.14]" />'
+          )
+
+          if package_id in content:
+              pattern = (
+                  r'<PackageDownload\b(?=[^>]*\bInclude=[\"\']'
+                  + re.escape(package_id)
+                  + r'[\"\'])[^>]*/>'
+              )
+              updated, count = re.subn(pattern, package_line, content, count=1, flags=re.IGNORECASE)
+              if count == 0:
+                  raise SystemExit("Found the NativeAOT package ID but could not safely normalize its PackageDownload item.")
+              content = updated
+          else:
+              item_group = f"""
+            <ItemGroup>
+              {package_line}
+            </ItemGroup>
+          """
+              if "</Project>" not in content:
+                  raise SystemExit("Could not find the closing Project element in Lynx.Cli.csproj.")
+              content = content.replace("</Project>", item_group + "\n</Project>", 1)
+
+          project.write_text(content, encoding="utf-8-sig")
+          print(f"Configured {package_id} version 10.0.14 for this Actions run only.")
+          PY
+
+      - name: Verify evaluated NativeAOT package request
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet msbuild src/Lynx.Cli/Lynx.Cli.csproj -getItem:PackageDownload > package-download-items.json
+          cat package-download-items.json
+          grep -qi 'Microsoft.NETCore.App.Runtime.NativeAOT.linux-bionic-arm64' package-download-items.json
+          grep -q '10.0.14' package-download-items.json
+
+      - name: Restore Lynx for Android ARM64 NativeAOT
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet restore src/Lynx.Cli/Lynx.Cli.csproj \
+            --runtime linux-bionic-arm64 \
+            --force \
+            --no-cache \
+            -p:Configuration=Release \
+            -p:PublishAot=true \
+            -p:PublishAotUsingRuntimePack=true \
+            -p:SelfContained=true \
+            -p:DisableUnsupportedError=true
+
+      - name: Verify patched compiler and Bionic runtime-pack packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          assets_path = Path("src/Lynx.Cli/obj/project.assets.json")
+          if not assets_path.is_file():
+              raise SystemExit(f"Missing restore assets: {assets_path}")
+          assets = json.loads(assets_path.read_text(encoding="utf-8"))
+          packages = assets.get("libraries", {})
+          ilc = [k for k in packages if k.lower().startswith("microsoft.dotnet.ilcompiler/")]
+          runtime_pack_id = "microsoft.netcore.app.runtime.nativeaot.linux-bionic-arm64"
+          download_items = []
+          for framework in assets.get("project", {}).get("frameworks", {}).values():
+              download_items.extend(framework.get("downloadDependencies", []))
+          downloaded_runtime = [
+              item for item in download_items
+              if item.get("name", "").lower() == runtime_pack_id
+          ]
+
+          print("ILCompiler entries:", ilc or "not listed in libraries")
+          print("NativeAOT runtime-pack downloadDependencies:", downloaded_runtime or "not listed")
+          if not any(k.lower() == "microsoft.dotnet.ilcompiler/10.0.14" for k in ilc):
+              raise SystemExit("Expected patched Microsoft.DotNet.ILCompiler 10.0.14 in project.assets.json")
+          if not downloaded_runtime:
+              raise SystemExit("Expected Bionic NativeAOT runtime pack in project.assets.json downloadDependencies")
+          if not any("10.0.14" in str(item.get("version", "")) for item in downloaded_runtime):
+              raise SystemExit("Bionic NativeAOT runtime pack is not pinned to 10.0.14")
+          print("PASS: patched .NET 10 NativeAOT package versions are resolved.")
+          PY
+
+          test -d "$HOME/.nuget/packages/microsoft.dotnet.ilcompiler/10.0.14"
+          test -d "$HOME/.nuget/packages/microsoft.netcore.app.runtime.nativeaot.linux-bionic-arm64/10.0.14"
+          echo "Both patched packages are present in the NuGet cache."
+
+      - name: Publish Lynx UCI executable for Android ARM64
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf out
+          mkdir -p out
+          dotnet publish src/Lynx.Cli/Lynx.Cli.csproj \
+            --configuration Release \
+            --runtime linux-bionic-arm64 \
+            --self-contained true \
+            --no-restore \
+            --output out \
+            -p:PublishAot=true \
+            -p:PublishAotUsingRuntimePack=true \
+            -p:DisableUnsupportedError=true \
+            -p:StripSymbols=true \
+            -p:ExecutableName=Lynx
+          test -s out/Lynx
+          test -s out/appsettings.json
+          cat > out/ANDROID-ARM64-BUILD-INFO.txt <<'EOF'
+          Engine: Lynx 1.11.0
+          CLI project: src/Lynx.Cli/Lynx.Cli.csproj
+          Runtime Identifier: linux-bionic-arm64
+          Build: .NET 10 NativeAOT, self-contained
+          .NET SDK: 10.0.114
+          NativeAOT/ILCompiler/runtime pack: 10.0.14
+          Android NDK: r27c
+          Android: Bionic ARM64 target (tested device is Android 16 / API 36)
+          CPU: generic ARM64; runtime AdvSimd/NEON capability detection
+          Search/evaluation: original Lynx source; no forced scalar build property
+          Slider attacks: BMI2/PEXT when supported; existing magic-bitboard fallback otherwise
+          NNUE/network sidecar: none present or required in the supplied source archive
+          UCI runtime diagnostic: runtimeconfig
+          Required sidecar: appsettings.json
+          EOF
+          echo "Published Android files:"
+          find out -maxdepth 2 -type f -print0 | xargs -0 -r ls -lh
+
+      - name: Verify Android ARM64 executable and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          file out/Lynx
+          readelf -h out/Lynx | grep -E 'Class:|Machine:'
+          readelf -h out/Lynx | grep -q AArch64
+          echo "Program interpreter (if any):"
+          readelf -l out/Lynx | grep 'Requesting program interpreter' || true
+          echo "Dynamic dependencies (if any):"
+          readelf -d out/Lynx | grep NEEDED || true
+          sha256sum out/Lynx | tee out/SHA256SUMS.txt
+
+      - name: Upload Lynx Android ARM64 NativeAOT artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lynx-Android-ARM64-NativeAOT-NEON
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
