@@ -5,6 +5,7 @@ using Lynx.UCI.Commands.GUI;
 using Microsoft.Extensions.Configuration;
 using NLog;
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
 using System.Text;
 using System.Text.Json;
@@ -412,6 +413,7 @@ public sealed class UCIHandler
                 $"SSE4.2 = {Sse42.IsSupported}",
                 $"AVX2 = {Avx2.IsSupported}",
                 $"Avx512BW = {Avx512BW.IsSupported}",
+                $"ARM AdvSimd (NEON) = {AdvSimd.IsSupported}",
             ];
 
             foreach (var instructionSet in intrinsics)
