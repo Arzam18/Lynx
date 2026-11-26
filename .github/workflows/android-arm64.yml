@@ -139,31 +139,6 @@ jobs:
             echo "- ISA target: $TARGET_DESCRIPTION"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Restore Lynx for Android NativeAOT
-        shell: bash
-        env:
-          ILC_INSTRUCTION_SET: ${{ matrix.ilc_instruction_set }}
-        run: |
-          set -euo pipefail
-
-          # MSBuild splits commas in /p: values; escape them before passing
-          # the comma-separated NativeAOT instruction set to the CLI.
-          ILC_INSTRUCTION_SET_MSBUILD="${ILC_INSTRUCTION_SET//,/%2C}"
-          echo "MSBuild-escaped IlcInstructionSet: $ILC_INSTRUCTION_SET_MSBUILD"
-
-          dotnet restore src/Lynx.Cli/Lynx.Cli.csproj \
-            --runtime linux-bionic-arm64 \
-            --force \
-            --no-cache \
-            -p:Configuration=Release \
-            -p:PublishAot=true \
-            -p:PublishAotUsingRuntimePack=true \
-            -p:SelfContained=true \
-            -p:DisableUnsupportedError=true \
-            "-p:IlcInstructionSet=$ILC_INSTRUCTION_SET_MSBUILD"
-
-          echo "PASS: Android Bionic ARM64 restore completed."
-
       - name: Publish Lynx Android ARM64 executable
         shell: bash
         env:
@@ -171,10 +146,6 @@ jobs:
           ILC_INSTRUCTION_SET: ${{ matrix.ilc_instruction_set }}
         run: |
           set -euo pipefail
-
-          # Use identical escaping for the publish invocation.
-          ILC_INSTRUCTION_SET_MSBUILD="${ILC_INSTRUCTION_SET//,/%2C}"
-          echo "MSBuild-escaped IlcInstructionSet: $ILC_INSTRUCTION_SET_MSBUILD"
 
           OUT_DIR="out/$VARIANT"
           rm -rf "$OUT_DIR"
@@ -187,14 +158,15 @@ jobs:
             --configuration Release \
             --runtime linux-bionic-arm64 \
             --self-contained true \
-            --no-restore \
             --output "$OUT_DIR" \
             -p:PublishAot=true \
             -p:PublishAotUsingRuntimePack=true \
             -p:DisableUnsupportedError=true \
+            -p:SelfContained=true \
+            -p:Configuration=Release \
             -p:StripSymbols=true \
             -p:ExecutableName=Lynx \
-            "-p:IlcInstructionSet=$ILC_INSTRUCTION_SET_MSBUILD"
+            "-p:IlcInstructionSet=$ILC_INSTRUCTION_SET"
 
           test -s "$OUT_DIR/Lynx"
           test -s "$OUT_DIR/appsettings.json"
