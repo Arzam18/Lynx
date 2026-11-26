@@ -1,0 +1,267 @@
+name: Lynx Android ARM64 (NEON + DotProd)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lynx-android-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Lynx Android ${{ matrix.label }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: neon
+            label: ARM64 NEON baseline
+            ilc_instruction_set: base,neon
+            artifact_name: Lynx-Android-ARM64-NEON
+            target_description: ARMv8-A + NEON baseline; no DotProd requirement
+          - variant: dotprod
+            label: ARM64 NEON + DotProd
+            ilc_instruction_set: base,neon,dotprod
+            artifact_name: Lynx-Android-ARM64-DotProd
+            target_description: ARM64 + NEON + DotProd; requires DotProd-capable CPU
+
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: 1
+      DOTNET_NOLOGO: 1
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+
+    steps:
+      - name: Checkout Lynx
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 11 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 11.0.100
+
+      - name: Install build utilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            binutils build-essential zlib1g-dev unzip curl python3
+
+      - name: Install Android NDK r27c
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Configure Android NDK toolchain
+        shell: bash
+        env:
+          NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          test -d "$TOOLCHAIN"
+          test -x "$TOOLCHAIN/clang"
+          test -x "$TOOLCHAIN/clang++"
+          test -x "$TOOLCHAIN/ld.lld"
+          test -x "$TOOLCHAIN/llvm-readelf"
+          test -x "$TOOLCHAIN/llvm-objdump"
+
+          # NativeAOT's Bionic cross-build discovers clang/ld.lld from PATH.
+          echo "$TOOLCHAIN" >> "$GITHUB_PATH"
+          echo "ANDROID_NDK_ROOT=$NDK_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_LLVM_BIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+
+          echo "Android NDK: $NDK_HOME"
+          "$TOOLCHAIN/clang" --version
+          "$TOOLCHAIN/ld.lld" --version
+
+      - name: Verify Lynx source and build target
+        shell: bash
+        env:
+          VARIANT: ${{ matrix.variant }}
+          ILC_INSTRUCTION_SET: ${{ matrix.ilc_instruction_set }}
+          TARGET_DESCRIPTION: ${{ matrix.target_description }}
+        run: |
+          set -euo pipefail
+
+          test -s global.json
+          test -s Directory.Build.props
+          test -s src/Lynx.Cli/Lynx.Cli.csproj
+          test -s src/Lynx/Lynx.csproj
+          test -s src/Lynx.Cli/appsettings.json
+
+          grep -q '<TargetFramework>net11.0</TargetFramework>' Directory.Build.props
+          grep -q 'Bmi2.X64.IsSupported' src/Lynx/Attacks.cs
+          grep -q 'Bmi1.IsSupported' src/Lynx/Model/Bitboard.cs
+          grep -q 'Sse.IsSupported' src/Lynx/Model/TranspositionTable.cs
+          grep -q 'Vector128.IsHardwareAccelerated' src/Lynx/MovePicker.cs
+          grep -q 'ARM AdvSimd (NEON)' src/Lynx/UCIHandler.cs
+          grep -q 'ARM DotProd' src/Lynx/UCIHandler.cs
+
+          SDK_VERSION="$(dotnet --version)"
+          if [[ "$SDK_VERSION" != "11.0.100" ]]; then
+            echo "ERROR: Expected .NET SDK 11.0.100, got $SDK_VERSION"
+            exit 1
+          fi
+
+          NDK_REVISION="$(sed -n 's/^Pkg.Revision = //p' "$ANDROID_NDK_ROOT/source.properties" | tr -d '\r')"
+          if [[ "$NDK_REVISION" != "27.2.12479018" ]]; then
+            echo "ERROR: Expected NDK r27c (27.2.12479018), got $NDK_REVISION"
+            cat "$ANDROID_NDK_ROOT/source.properties"
+            exit 1
+          fi
+
+          echo "Variant: $VARIANT"
+          echo "Target: $TARGET_DESCRIPTION"
+          echo "NativeAOT IlcInstructionSet: $ILC_INSTRUCTION_SET"
+          echo "Framework: $(dotnet msbuild src/Lynx.Cli/Lynx.Cli.csproj -getProperty:TargetFramework)"
+          echo "Lynx version: $(dotnet msbuild src/Lynx.Cli/Lynx.Cli.csproj -getProperty:Version)"
+          dotnet --info
+
+          {
+            echo "### Lynx Android build configuration"
+            echo "- Source target framework: net11.0"
+            echo "- .NET SDK: $SDK_VERSION"
+            echo "- Runtime identifier: linux-bionic-arm64"
+            echo "- NDK: r27c ($NDK_REVISION)"
+            echo "- Variant: $VARIANT"
+            echo "- NativeAOT instruction sets: $ILC_INSTRUCTION_SET"
+            echo "- ISA target: $TARGET_DESCRIPTION"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore Lynx for Android NativeAOT
+        shell: bash
+        env:
+          ILC_INSTRUCTION_SET: ${{ matrix.ilc_instruction_set }}
+        run: |
+          set -euo pipefail
+
+          dotnet restore src/Lynx.Cli/Lynx.Cli.csproj \
+            --runtime linux-bionic-arm64 \
+            --force \
+            --no-cache \
+            -p:Configuration=Release \
+            -p:PublishAot=true \
+            -p:PublishAotUsingRuntimePack=true \
+            -p:SelfContained=true \
+            -p:DisableUnsupportedError=true \
+            "-p:IlcInstructionSet=$ILC_INSTRUCTION_SET"
+
+          echo "PASS: Android Bionic ARM64 restore completed."
+
+      - name: Publish Lynx Android ARM64 executable
+        shell: bash
+        env:
+          VARIANT: ${{ matrix.variant }}
+          ILC_INSTRUCTION_SET: ${{ matrix.ilc_instruction_set }}
+        run: |
+          set -euo pipefail
+
+          OUT_DIR="out/$VARIANT"
+          rm -rf "$OUT_DIR"
+          mkdir -p "$OUT_DIR"
+
+          echo "Publishing Lynx Android variant: $VARIANT"
+          echo "IlcInstructionSet: $ILC_INSTRUCTION_SET"
+
+          dotnet publish src/Lynx.Cli/Lynx.Cli.csproj \
+            --configuration Release \
+            --runtime linux-bionic-arm64 \
+            --self-contained true \
+            --no-restore \
+            --output "$OUT_DIR" \
+            -p:PublishAot=true \
+            -p:PublishAotUsingRuntimePack=true \
+            -p:DisableUnsupportedError=true \
+            -p:StripSymbols=true \
+            -p:ExecutableName=Lynx \
+            "-p:IlcInstructionSet=$ILC_INSTRUCTION_SET"
+
+          test -s "$OUT_DIR/Lynx"
+          test -s "$OUT_DIR/appsettings.json"
+
+          cat > "$OUT_DIR/ANDROID-BUILD-INFO.txt" <<EOF
+          Engine: Lynx
+          Source target framework: net11.0
+          CLI project: src/Lynx.Cli/Lynx.Cli.csproj
+          Runtime identifier: linux-bionic-arm64
+          Build: .NET 11 NativeAOT, self-contained
+          .NET SDK: 11.0.100
+          Android NDK: r27c (27.2.12479018)
+          Android minimum API: 24
+          Variant: $VARIANT
+          NativeAOT IlcInstructionSet: $ILC_INSTRUCTION_SET
+          ISA: ${{ matrix.target_description }}
+          Portable vector code: System.Runtime.Intrinsics.Vector128
+          ARM runtime diagnostics: AdvSimd (NEON), Dp (DotProd)
+          NNUE/network sidecar: none required by the supplied Lynx source
+          Required sidecar: appsettings.json
+          EOF
+
+          echo "Published files:"
+          find "$OUT_DIR" -maxdepth 2 -type f -print0 | xargs -0 -r ls -lh
+
+      - name: Verify Android ARM64 ELF and package
+        shell: bash
+        env:
+          VARIANT: ${{ matrix.variant }}
+          ILC_INSTRUCTION_SET: ${{ matrix.ilc_instruction_set }}
+        run: |
+          set -euo pipefail
+
+          OUT_DIR="out/$VARIANT"
+          BINARY="$OUT_DIR/Lynx"
+          READELF="$ANDROID_LLVM_BIN/llvm-readelf"
+
+          echo "===== Binary format ====="
+          file "$BINARY"
+          "$READELF" -h "$BINARY" | tee "$OUT_DIR/ELF-HEADER.txt"
+          grep -q 'AArch64' "$OUT_DIR/ELF-HEADER.txt"
+
+          echo
+          echo "===== Program interpreter ====="
+          "$READELF" -l "$BINARY" | grep 'Requesting program interpreter' || true
+
+          echo
+          echo "===== Dynamic dependencies ====="
+          "$READELF" -d "$BINARY" | tee "$OUT_DIR/ELF-DYNAMIC.txt" || true
+          if grep -q 'libc++_shared.so' "$OUT_DIR/ELF-DYNAMIC.txt"; then
+            echo 'ERROR: executable depends on libc++_shared.so'
+            exit 1
+          fi
+
+          echo
+          echo "===== Disassembly sample ====="
+          "$ANDROID_LLVM_BIN/llvm-objdump" -d "$BINARY" > "$OUT_DIR/DISASSEMBLY.txt"
+          grep -E -m 20 '\b(v[0-9]+\.|[su]dot|[su]mmla)' "$OUT_DIR/DISASSEMBLY.txt" || true
+
+          sha256sum "$BINARY" | tee "$OUT_DIR/SHA256SUMS.txt"
+          chmod +x "$BINARY"
+
+          BINARY_SIZE="$(wc -c < "$BINARY")"
+          {
+            echo "### Android ELF validation ($VARIANT)"
+            echo "- Binary: $BINARY"
+            echo "- Size: $BINARY_SIZE bytes"
+            echo "- ELF machine: AArch64"
+            echo "- IlcInstructionSet: $ILC_INSTRUCTION_SET"
+            echo "- libc++_shared.so dependency: absent"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Lynx Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: out/${{ matrix.variant }}/*
+          if-no-files-found: error
+          retention-days: 30
