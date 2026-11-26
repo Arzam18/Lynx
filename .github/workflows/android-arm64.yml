@@ -144,6 +144,10 @@ jobs:
         env:
           VARIANT: ${{ matrix.variant }}
           ILC_INSTRUCTION_SET: ${{ matrix.ilc_instruction_set }}
+          # Supply the comma-separated value as an environment-backed MSBuild
+          # property. This avoids the Unix MSBuild -p switch parser treating
+          # commas as separators between separate property assignments.
+          IlcInstructionSet: ${{ matrix.ilc_instruction_set }}
         run: |
           set -euo pipefail
 
@@ -152,7 +156,14 @@ jobs:
           mkdir -p "$OUT_DIR"
 
           echo "Publishing Lynx Android variant: $VARIANT"
-          echo "IlcInstructionSet: $ILC_INSTRUCTION_SET"
+          echo "IlcInstructionSet environment value: $IlcInstructionSet"
+
+          RESOLVED_ILC="$(dotnet msbuild src/Lynx.Cli/Lynx.Cli.csproj -getProperty:IlcInstructionSet)"
+          echo "MSBuild resolved IlcInstructionSet: $RESOLVED_ILC"
+          if [[ "$RESOLVED_ILC" != "$ILC_INSTRUCTION_SET" ]]; then
+            echo "ERROR: MSBuild did not import the IlcInstructionSet environment property."
+            exit 1
+          fi
 
           dotnet publish src/Lynx.Cli/Lynx.Cli.csproj \
             --configuration Release \
@@ -166,7 +177,6 @@ jobs:
             -p:Configuration=Release \
             -p:StripSymbols=true \
             -p:ExecutableName=Lynx \
-            "-p:IlcInstructionSet=$ILC_INSTRUCTION_SET"
 
           test -s "$OUT_DIR/Lynx"
           test -s "$OUT_DIR/appsettings.json"
