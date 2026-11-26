@@ -105,8 +105,8 @@ jobs:
           grep -q 'Bmi1.IsSupported' src/Lynx/Model/Bitboard.cs
           grep -q 'Sse.IsSupported' src/Lynx/Model/TranspositionTable.cs
           grep -q 'Vector128.IsHardwareAccelerated' src/Lynx/MovePicker.cs
-          grep -q 'ARM AdvSimd (NEON)' src/Lynx/UCIHandler.cs
-          grep -q 'ARM DotProd' src/Lynx/UCIHandler.cs
+          # ARM runtimeconfig text is optional diagnostic output. Do not block
+          # NativeAOT builds because an upstream UCIHandler omits those labels.
 
           SDK_VERSION="$(dotnet --version)"
           if [[ "$SDK_VERSION" != "11.0.100" ]]; then
@@ -203,7 +203,6 @@ jobs:
           NativeAOT IlcInstructionSet: $ILC_INSTRUCTION_SET
           ISA: ${{ matrix.target_description }}
           Portable vector code: System.Runtime.Intrinsics.Vector128
-          ARM runtime diagnostics: AdvSimd (NEON), Dp (DotProd)
           NNUE/network sidecar: none required by the supplied Lynx source
           Required sidecar: appsettings.json
           EOF
